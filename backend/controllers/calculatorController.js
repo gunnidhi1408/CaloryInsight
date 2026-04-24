@@ -164,30 +164,68 @@ const searchFood = async (req, res, next) => {
       return res.status(400).json({ message: 'Please provide a search term' });
     }
 
-    // case insensitive partial match
-    let foods = await FoodItem.find({
-      name: { $regex: q.trim(), $options: 'i' }
-    }).limit(20);
+    let foods = [];
+    const query = q.trim();
 
-    // If no food found in DB, return a default estimated item
+    try {
+      // Try fetching from USDA API
+      const apiKey = process.env.USDA_API_KEY || 'DEMO_KEY';
+      const usdaResponse = await fetch(`https://api.nal.usda.gov/fdc/v1/foods/search?query=${encodeURIComponent(query)}&api_key=${apiKey}&pageSize=10`);
+      
+      if (usdaResponse.ok) {
+        const data = await usdaResponse.json();
+        if (data.foods && data.foods.length > 0) {
+          foods = data.foods.map(food => {
+            // Helper to find nutrient value
+            const getNutrient = (id) => {
+              const nutrient = food.foodNutrients.find(n => n.nutrientId === id);
+              return nutrient ? Math.round(nutrient.value * 10) / 10 : 0;
+            };
+
+            return {
+              _id: food.fdcId.toString(),
+              name: food.description.toLowerCase(),
+              caloriesPer100g: getNutrient(1008), // Energy
+              protein: getNutrient(1003), // Protein
+              carbs: getNutrient(1005), // Carbs
+              fat: getNutrient(1004), // Fat
+              fiber: getNutrient(1079), // Fiber
+              category: food.foodCategory || 'USDA Data'
+            };
+          });
+        }
+      }
+    } catch (apiError) {
+      console.error("USDA API Error:", apiError);
+      // Fall through to local database search
+    }
+
+    // Fallback to local database if USDA API fails or returns no results
     if (foods.length === 0) {
-      foods = [{
-        _id: 'default-estimation',
-        name: `${q.trim()} (Estimated)`,
-        caloriesPer100g: 200, // default assumed calories
-        protein: 5,
-        carbs: 20,
-        fat: 10,
-        fiber: 2,
-        category: 'other'
-      }];
+      foods = await FoodItem.find({
+        name: { $regex: query, $options: 'i' }
+      }).limit(20);
+      
+      // If no food found in DB, return a default estimated item
+      if (foods.length === 0) {
+        foods = [{
+          _id: 'default-estimation',
+          name: `${query} (Estimated)`,
+          caloriesPer100g: 200, // default assumed calories
+          protein: 5,
+          carbs: 20,
+          fat: 10,
+          fiber: 2,
+          category: 'other'
+        }];
+      }
     }
 
     // log the search
     await Calculation.create({
       userId: req.user._id,
       type: 'food_search',
-      inputs: { query: q.trim() },
+      inputs: { query },
       result: { matchCount: foods.length, topResult: foods[0].name }
     });
 
